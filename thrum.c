@@ -6,6 +6,7 @@
 #include <sys/time.h>
 
 #define VOTE_PERIOD 2
+#define SYNC_TIMEOUT 2
 
 double vote_time = 0;
 double assert_time = 0;
@@ -21,12 +22,22 @@ double time_offset = 0;
 int winning = 0;
 int voting = 0;
 int master = 0;
+int synced = 0;
+double sync_start = 0;
+int ping_n = 0;
 
-void assert_master() {
+double now() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return((double) tv.tv_sec + ((double) tv.tv_usec / 1000000.0) + time_offset);
+}
+
+void send_ping() {
+  printf("send ping\n");
   int rv = lo_send_from(multicast_address, 
                         lo_server_thread_get_server(ms), 
                         LO_TT_IMMEDIATE,
-                        "/master/assert", "i", id);
+                        "/app/thrum/ping", "if", id, now());
   if (rv == -1) {
     printf("multicast send error %d: %s\n", lo_address_errno(multicast_address), 
            lo_address_errstr(multicast_address)
@@ -34,11 +45,36 @@ void assert_master() {
   }
 }
 
-void claim_master() {
+void send_pong(int slave_id, double sent) {
+  printf("send pong\n");
   int rv = lo_send_from(multicast_address, 
                         lo_server_thread_get_server(ms), 
                         LO_TT_IMMEDIATE,
-                        "/master/claim", "i", id);
+                        "/app/thrum/pong", "iff", slave_id, sent, now());
+  if (rv == -1) {
+    printf("multicast send error %d: %s\n", lo_address_errno(multicast_address), 
+           lo_address_errstr(multicast_address)
+           );
+  }
+}
+
+void send_assert_master() {
+  int rv = lo_send_from(multicast_address, 
+                        lo_server_thread_get_server(ms), 
+                        LO_TT_IMMEDIATE,
+                        "/app/thrum/assert", "i", id);
+  if (rv == -1) {
+    printf("multicast send error %d: %s\n", lo_address_errno(multicast_address), 
+           lo_address_errstr(multicast_address)
+           );
+  }
+}
+
+void send_claim_master() {
+  int rv = lo_send_from(multicast_address, 
+                        lo_server_thread_get_server(ms), 
+                        LO_TT_IMMEDIATE,
+                        "/app/thrum/claim", "i", id);
   //printf("claiming\n");
   if (rv == -1) {
     printf("multicast send error %d: %s\n", lo_address_errno(multicast_address), 
@@ -51,11 +87,6 @@ void error(int num, const char *msg, const char *path) {
     printf("liblo server error %d in path %s: %s\n", num, path, msg);
 }
 
-double now() {
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  return((double) tv.tv_sec + ((double) tv.tv_usec / 1000000.0) + time_offset);
-}
 
 int generic_handler(const char *path, const char *types, lo_arg **argv,
 		    int argc, void *data, void *user_data)
@@ -96,11 +127,9 @@ int assert_handler(const char *path, const char *types, lo_arg **argv,
   //printf("got assert from %d\n", master_id);
 
   voting = 0;
-
   master_address = lo_message_get_source(data);
   assert_time = now();
 
-  // TODO - worry about rounding errors, should probably use ints
   if (master_id == id) {
     master = 1;
   }
@@ -110,6 +139,40 @@ int assert_handler(const char *path, const char *types, lo_arg **argv,
     }
   }
 
+  if (master_id >= 0 && synced == 0) {
+    if ((now() - sync_start) > SYNC_TIMEOUT) {
+      sync_start = now();
+      ping_n = 0;
+      send_ping();
+    }
+  }
+
+  return(0);
+}
+
+int ping_handler(const char *path, const char *types, lo_arg **argv,
+                 int argc, lo_message data, void *user_data) {
+  if (master) {
+    int slave_id = argv[0]->i;
+    double sent = argv[1]->f;
+    send_pong(slave_id, sent);
+  }
+  return(0);
+}
+
+int pong_handler(const char *path, const char *types, lo_arg **argv,
+                 int argc, lo_message data, void *user_data) {
+  if (!master && argv[0]->i == id) {
+    double t = now();
+    double sent = argv[1]->f;
+    double received = argv[2]->f;
+    double latency = (t - sent) / 2;
+    // TODO - average over several goes
+    time_offset = received - t - latency;
+    synced = 1;
+    printf("synced with offset %f, latency %f", time_offset, latency);
+  }
+  
   return(0);
 }
 
@@ -133,16 +196,17 @@ void cycle() {
 
   if (voting && ((now() - vote_time) > VOTE_PERIOD) && winning) {
     master = 1;
+    synced = 1;
     master_id = id;
     master_address = NULL;
   }
   
   if (master_id<0 && !voting) {
-    claim_master();
+    send_claim_master();
   }
 
   if (master) {
-    assert_master();
+    send_assert_master();
   }
 }
 
@@ -153,8 +217,10 @@ int main (int argc, char **argv) {
   //st = lo_server_thread_new(NULL, error);
   //lo_server_thread_start(st);
   //lo_server_thread_add_method(ms, NULL, NULL, generic_handler, NULL);
-  lo_server_thread_add_method(ms, "/master/claim", "i", claim_handler, NULL);
-  lo_server_thread_add_method(ms, "/master/assert", "i", assert_handler, NULL);
+  lo_server_thread_add_method(ms, "/app/thrum/claim", "i", claim_handler, NULL);
+  lo_server_thread_add_method(ms, "/app/thrum/assert", "i", assert_handler, NULL);
+  lo_server_thread_add_method(ms, "/app/thrum/ping", "if", ping_handler, NULL);
+  lo_server_thread_add_method(ms, "/app/thrum/pong", "iff", pong_handler, NULL);
   multicast_address = lo_address_new("224.0.1.1", "6010");
   lo_address_set_ttl(multicast_address, 1); /* set multicast scope to LAN */
   sleep(1);
