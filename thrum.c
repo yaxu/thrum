@@ -12,23 +12,21 @@ double assert_time = 0;
 
 lo_address master_address = NULL;
 lo_address multicast_address = NULL;
-float master_id = -1;
+int master_id = -1;
 lo_server ms;
 
-float id;
+int id;
 double time_offset = 0;
 
 int winning = 0;
 int voting = 0;
 int master = 0;
 
-
-
 void assert_master() {
   int rv = lo_send_from(multicast_address, 
                         lo_server_thread_get_server(ms), 
                         LO_TT_IMMEDIATE,
-                        "/master/assert", "f", id);
+                        "/master/assert", "i", id);
   if (rv == -1) {
     printf("multicast send error %d: %s\n", lo_address_errno(multicast_address), 
            lo_address_errstr(multicast_address)
@@ -40,8 +38,8 @@ void claim_master() {
   int rv = lo_send_from(multicast_address, 
                         lo_server_thread_get_server(ms), 
                         LO_TT_IMMEDIATE,
-                        "/master/claim", "f", id);
-  printf("claiming\n");
+                        "/master/claim", "i", id);
+  //printf("claiming\n");
   if (rv == -1) {
     printf("multicast send error %d: %s\n", lo_address_errno(multicast_address), 
            lo_address_errstr(multicast_address)
@@ -77,22 +75,15 @@ int generic_handler(const char *path, const char *types, lo_arg **argv,
 
 int claim_handler(const char *path, const char *types, lo_arg **argv,
                  int argc, lo_message data, void *user_data) {
-  float remote_id = argv[0]->f;
-  printf("got claim from %f\n", remote_id);
-
+  int remote_id = argv[0]->i;
+  //printf("got claim\n");
   if (! voting) {
     voting = 1;
     vote_time = now();
-    if ( (remote_id > id)) {
-      winning = 1;
-      //claim_master();
-    }
-    else if (remote_id < id) {
-      winning = 0;
-    }
+    winning = (id <= remote_id);
   }
   else {
-    if (remote_id < id) {
+    if (id > remote_id) {
       winning = 0;
     }
   }
@@ -101,19 +92,29 @@ int claim_handler(const char *path, const char *types, lo_arg **argv,
 
 int assert_handler(const char *path, const char *types, lo_arg **argv,
                  int argc, lo_message data, void *user_data) {
+  master_id = argv[0]->i;
+  //printf("got assert from %d\n", master_id);
+
   voting = 0;
-  master_id = argv[0]->f;
-  printf("got assert from %f\n", master_id);
+
   master_address = lo_message_get_source(data);
   assert_time = now();
+
+  // TODO - worry about rounding errors, should probably use ints
   if (master_id == id) {
     master = 1;
   }
+  else if (master) {
+    if (master_id < id) {
+      master = 0;
+    }
+  }
+
   return(0);
 }
 
 void setid() {
-  id = (float) rand() / RAND_MAX;
+  id = rand();
 }
 
 void initrand() {
@@ -123,6 +124,13 @@ void initrand() {
 }
 
 void cycle() {
+  if (master) {
+    printf("master\n");
+  }
+  else {
+    printf("client\n");
+  }
+
   if (voting && ((now() - vote_time) > VOTE_PERIOD) && winning) {
     master = 1;
     master_id = id;
@@ -144,9 +152,9 @@ int main (int argc, char **argv) {
   ms = lo_server_thread_new_multicast("224.0.1.1", "6010", error);
   //st = lo_server_thread_new(NULL, error);
   //lo_server_thread_start(st);
-  lo_server_thread_add_method(ms, NULL, NULL, generic_handler, NULL);
-  lo_server_thread_add_method(ms, "/master/claim", "f", claim_handler, NULL);
-  lo_server_thread_add_method(ms, "/master/assert", "f", assert_handler, NULL);
+  //lo_server_thread_add_method(ms, NULL, NULL, generic_handler, NULL);
+  lo_server_thread_add_method(ms, "/master/claim", "i", claim_handler, NULL);
+  lo_server_thread_add_method(ms, "/master/assert", "i", assert_handler, NULL);
   multicast_address = lo_address_new("224.0.1.1", "6010");
   lo_address_set_ttl(multicast_address, 1); /* set multicast scope to LAN */
   sleep(1);
