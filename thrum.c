@@ -2,11 +2,13 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <math.h>
 #include <lo/lo.h>
 #include <sys/time.h>
 
 #define VOTE_PERIOD 2
 #define SYNC_TIMEOUT 2
+#define JAN_1970 0x83aa7e80      /* 2208988800 1970 - 1900 in seconds */
 
 double vote_time = 0;
 double assert_time = 0;
@@ -17,7 +19,7 @@ int master_id = -1;
 lo_server ms;
 
 int id;
-double time_offset = 0;
+float time_offset = 0;
 
 int winning = 0;
 int voting = 0;
@@ -26,18 +28,59 @@ int synced = 0;
 double sync_start = 0;
 int ping_n = 0;
 
-double now() {
+double t2f (lo_timetag t) {
+  return (double) (t.sec - JAN_1970) + (double)t.frac * 0.00000000023283064365;
+}
+
+lo_timetag f2t (double f) {
+  lo_timetag result;
+  result.sec = floor(f) + JAN_1970;
+  result.frac = (f - (double) result.sec) / 0.00000000023283064365;
+  return(result);
+}
+
+double now_f() {
+  double result;
   struct timeval tv;
   gettimeofday(&tv, NULL);
-  return((double) tv.tv_sec + ((double) tv.tv_usec / 1000000.0) + time_offset);
+  
+  result = (double) tv.tv_sec + ((double) tv.tv_usec / 1000000.0) + time_offset;
+  return(result);
+}
+
+void now_t(lo_timetag *t) {
+  int sec_offset = floor(time_offset);
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+
+  tv.tv_sec += sec_offset;
+  tv.tv_usec += (time_offset - (double) sec_offset) * 1000000;
+
+  if (tv.tv_usec < 0) {
+    printf("bump up\n");
+    tv.tv_sec--;
+    tv.tv_usec += 1000000;
+  }
+  if (tv.tv_usec >= 1000000) {
+    printf("bump down\n");
+    tv.tv_sec++;
+    tv.tv_usec -= 1000000;
+  }
+
+  t->sec = tv.tv_sec + JAN_1970;
+  t->frac = tv.tv_usec * 4294.967295;
 }
 
 void send_ping() {
-  printf("send ping\n");
+  lo_timetag t;
+  now_t(&t);
+  
+  printf("send ping at %f offset %f\n", t2f(t), time_offset);
+
   int rv = lo_send_from(multicast_address, 
                         lo_server_thread_get_server(ms), 
                         LO_TT_IMMEDIATE,
-                        "/app/thrum/ping", "if", id, now());
+                        "/app/thrum/ping", "it", id, t);
   if (rv == -1) {
     printf("multicast send error %d: %s\n", lo_address_errno(multicast_address), 
            lo_address_errstr(multicast_address)
@@ -45,12 +88,14 @@ void send_ping() {
   }
 }
 
-void send_pong(int slave_id, double sent) {
+void send_pong(int slave_id, lo_timetag sent) {
+  lo_timetag t;
+  now_t(&t);
   printf("send pong\n");
   int rv = lo_send_from(multicast_address, 
                         lo_server_thread_get_server(ms), 
                         LO_TT_IMMEDIATE,
-                        "/app/thrum/pong", "iff", slave_id, sent, now());
+                        "/app/thrum/pong", "itt", slave_id, sent, t);
   if (rv == -1) {
     printf("multicast send error %d: %s\n", lo_address_errno(multicast_address), 
            lo_address_errstr(multicast_address)
@@ -110,7 +155,7 @@ int claim_handler(const char *path, const char *types, lo_arg **argv,
   //printf("got claim\n");
   if (! voting) {
     voting = 1;
-    vote_time = now();
+    vote_time = now_f();
     winning = (id <= remote_id);
   }
   else {
@@ -128,7 +173,7 @@ int assert_handler(const char *path, const char *types, lo_arg **argv,
 
   voting = 0;
   master_address = lo_message_get_source(data);
-  assert_time = now();
+  assert_time = now_f();
 
   if (master_id == id) {
     master = 1;
@@ -140,8 +185,9 @@ int assert_handler(const char *path, const char *types, lo_arg **argv,
   }
 
   if (master_id >= 0 && synced == 0) {
-    if ((now() - sync_start) > SYNC_TIMEOUT) {
-      sync_start = now();
+    double now = now_f();
+    if ((now - sync_start) > SYNC_TIMEOUT) {
+      sync_start = now;
       ping_n = 0;
       send_ping();
     }
@@ -154,7 +200,8 @@ int ping_handler(const char *path, const char *types, lo_arg **argv,
                  int argc, lo_message data, void *user_data) {
   if (master) {
     int slave_id = argv[0]->i;
-    double sent = argv[1]->f;
+    lo_timetag sent = argv[1]->t;
+    printf("got ping from %i, %f\n", slave_id, t2f(sent));
     send_pong(slave_id, sent);
   }
   return(0);
@@ -163,14 +210,16 @@ int ping_handler(const char *path, const char *types, lo_arg **argv,
 int pong_handler(const char *path, const char *types, lo_arg **argv,
                  int argc, lo_message data, void *user_data) {
   if (!master && argv[0]->i == id) {
-    double t = now();
-    double sent = argv[1]->f;
-    double received = argv[2]->f;
-    double latency = (t - sent) / 2;
+    lo_timetag sent = argv[1]->t;
+    lo_timetag received = argv[2]->t;
+    double now = now_f();
+    printf("sent: %f received: %f now: %f\n", 
+           t2f(sent), t2f(received), now);
+    double latency = (now - t2f(sent)) / 2.0;
     // TODO - average over several goes
-    time_offset = received - t - latency;
+    time_offset = t2f(received) - now - latency;
     synced = 1;
-    printf("synced with offset %f, latency %f", time_offset, latency);
+    printf("synced with offset %f, latency %f\n", time_offset, latency);
   }
   
   return(0);
@@ -194,7 +243,7 @@ void cycle() {
     printf("client\n");
   }
 
-  if (voting && ((now() - vote_time) > VOTE_PERIOD) && winning) {
+  if (voting && ((now_f() - vote_time) > VOTE_PERIOD) && winning) {
     master = 1;
     synced = 1;
     master_id = id;
@@ -211,6 +260,10 @@ void cycle() {
 }
 
 int main (int argc, char **argv) {
+  lo_timetag t;
+  now_t(&t);
+  //printf("test: %f %f %f\n", now_f(), t2f(f2t(now_f())), t2f(t));
+
   initrand();
   setid();
   ms = lo_server_thread_new_multicast("224.0.1.1", "6010", error);
@@ -219,8 +272,8 @@ int main (int argc, char **argv) {
   //lo_server_thread_add_method(ms, NULL, NULL, generic_handler, NULL);
   lo_server_thread_add_method(ms, "/app/thrum/claim", "i", claim_handler, NULL);
   lo_server_thread_add_method(ms, "/app/thrum/assert", "i", assert_handler, NULL);
-  lo_server_thread_add_method(ms, "/app/thrum/ping", "if", ping_handler, NULL);
-  lo_server_thread_add_method(ms, "/app/thrum/pong", "iff", pong_handler, NULL);
+  lo_server_thread_add_method(ms, "/app/thrum/ping", "it", ping_handler, NULL);
+  lo_server_thread_add_method(ms, "/app/thrum/pong", "itt", pong_handler, NULL);
   multicast_address = lo_address_new("224.0.1.1", "6010");
   lo_address_set_ttl(multicast_address, 1); /* set multicast scope to LAN */
   sleep(1);
