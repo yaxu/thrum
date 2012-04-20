@@ -7,7 +7,9 @@
 #include <sys/time.h>
 
 #define VOTE_PERIOD 2
-#define SYNC_TIMEOUT 2
+#define SYNC_TIMEOUT 12
+#define SYNC_COUNT 10
+
 #define JAN_1970 0x83aa7e80      /* 2208988800 1970 - 1900 in seconds */
 
 double vote_time = 0;
@@ -26,7 +28,9 @@ int voting = 0;
 int master = 0;
 int synced = 0;
 double sync_start = 0;
+double time_offset_tests[SYNC_COUNT];
 int ping_n = 0;
+int sync_next = 0;
 
 double t2f (lo_timetag t) {
   return (double) (t.sec - JAN_1970) + (double)t.frac * 0.00000000023283064365;
@@ -184,12 +188,13 @@ int assert_handler(const char *path, const char *types, lo_arg **argv,
     }
   }
 
-  if (master_id >= 0 && synced == 0) {
+  if (master_id >= 0 && synced < SYNC_COUNT) {
     double now = now_f();
     if ((now - sync_start) > SYNC_TIMEOUT) {
       sync_start = now;
       ping_n = 0;
-      send_ping();
+      synced = 0;
+      sync_next = 1;
     }
   }
 
@@ -217,9 +222,21 @@ int pong_handler(const char *path, const char *types, lo_arg **argv,
            t2f(sent), t2f(received), now);
     double latency = (now - t2f(sent)) / 2.0;
     // TODO - average over several goes
-    time_offset = t2f(received) - now - latency;
-    synced = 1;
-    printf("synced with offset %f, latency %f\n", time_offset, latency);
+
+    time_offset_tests[synced++] = t2f(received) - now - latency;
+    printf("[%d] pong with offset %f, latency %f\n", synced, time_offset_tests[synced-1], latency);
+    if (synced < SYNC_COUNT) {
+      sync_next = 1;
+    }
+    else {
+      int i;
+      float total = 0;
+      for (i=0; i<SYNC_COUNT; ++i) {
+        total += time_offset_tests[i];
+      }
+      time_offset = total / (float) SYNC_COUNT;
+      printf("average: %f\n", time_offset);
+    }
   }
   
   return(0);
@@ -245,7 +262,7 @@ void cycle() {
 
   if (voting && ((now_f() - vote_time) > VOTE_PERIOD) && winning) {
     master = 1;
-    synced = 1;
+    synced = SYNC_COUNT;
     master_id = id;
     master_address = NULL;
   }
@@ -281,7 +298,11 @@ int main (int argc, char **argv) {
 
   while (1) {
     cycle();
-    sleep(1);
+    if (sync_next) {
+      sync_next = 0;
+      send_ping();
+    }
+    usleep(100000);
   }
   return(0);
 }

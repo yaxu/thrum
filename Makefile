@@ -1,6 +1,6 @@
 CC=gcc
 CFLAGS = -g -Wall
-LDFLAGS = -llo
+LDFLAGS = -llo -lm
 
 all: thrum
 
