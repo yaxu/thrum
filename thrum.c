@@ -5,12 +5,9 @@
 #include <math.h>
 #include <lo/lo.h>
 #include <sys/time.h>
+#include <pthread.h>
 
-#define VOTE_PERIOD 2
-#define SYNC_TIMEOUT 12
-#define SYNC_COUNT 10
-
-#define JAN_1970 0x83aa7e80      /* 2208988800 1970 - 1900 in seconds */
+#include "thrum.h"
 
 double vote_time = 0;
 double assert_time = 0;
@@ -32,6 +29,11 @@ double time_offset_tests[SYNC_COUNT];
 int ping_n = 0;
 int sync_next = 0;
 
+t_change *last_change = NULL;
+t_change *next_change = NULL;
+
+pthread_mutex_t change_lock;
+
 double t2f (lo_timetag t) {
   return (double) (t.sec - JAN_1970) + (double)t.frac * 0.00000000023283064365;
 }
@@ -47,7 +49,7 @@ double now_f() {
   double result;
   struct timeval tv;
   gettimeofday(&tv, NULL);
-  
+
   result = (double) tv.tv_sec + ((double) tv.tv_usec / 1000000.0) + time_offset;
   return(result);
 }
@@ -78,15 +80,15 @@ void now_t(lo_timetag *t) {
 void send_ping() {
   lo_timetag t;
   now_t(&t);
-  
+
   printf("send ping at %f offset %f\n", t2f(t), time_offset);
 
-  int rv = lo_send_from(multicast_address, 
-                        lo_server_thread_get_server(ms), 
+  int rv = lo_send_from(multicast_address,
+                        lo_server_thread_get_server(ms),
                         LO_TT_IMMEDIATE,
                         "/app/thrum/ping", "it", id, t);
   if (rv == -1) {
-    printf("multicast send error %d: %s\n", lo_address_errno(multicast_address), 
+    printf("multicast send error %d: %s\n", lo_address_errno(multicast_address),
            lo_address_errstr(multicast_address)
            );
   }
@@ -96,37 +98,37 @@ void send_pong(int slave_id, lo_timetag sent) {
   lo_timetag t;
   now_t(&t);
   printf("send pong\n");
-  int rv = lo_send_from(multicast_address, 
-                        lo_server_thread_get_server(ms), 
+  int rv = lo_send_from(multicast_address,
+                        lo_server_thread_get_server(ms),
                         LO_TT_IMMEDIATE,
                         "/app/thrum/pong", "itt", slave_id, sent, t);
   if (rv == -1) {
-    printf("multicast send error %d: %s\n", lo_address_errno(multicast_address), 
+    printf("multicast send error %d: %s\n", lo_address_errno(multicast_address),
            lo_address_errstr(multicast_address)
            );
   }
 }
 
 void send_assert_master() {
-  int rv = lo_send_from(multicast_address, 
-                        lo_server_thread_get_server(ms), 
+  int rv = lo_send_from(multicast_address,
+                        lo_server_thread_get_server(ms),
                         LO_TT_IMMEDIATE,
                         "/app/thrum/assert", "i", id);
   if (rv == -1) {
-    printf("multicast send error %d: %s\n", lo_address_errno(multicast_address), 
+    printf("multicast send error %d: %s\n", lo_address_errno(multicast_address),
            lo_address_errstr(multicast_address)
            );
   }
 }
 
 void send_claim_master() {
-  int rv = lo_send_from(multicast_address, 
-                        lo_server_thread_get_server(ms), 
+  int rv = lo_send_from(multicast_address,
+                        lo_server_thread_get_server(ms),
                         LO_TT_IMMEDIATE,
                         "/app/thrum/claim", "i", id);
   //printf("claiming\n");
   if (rv == -1) {
-    printf("multicast send error %d: %s\n", lo_address_errno(multicast_address), 
+    printf("multicast send error %d: %s\n", lo_address_errno(multicast_address),
            lo_address_errstr(multicast_address)
            );
   }
@@ -141,7 +143,7 @@ int generic_handler(const char *path, const char *types, lo_arg **argv,
 		    int argc, void *data, void *user_data)
 {
     int i;
-    
+
     printf("path: <%s>\n", path);
     for (i=0; i<argc; i++) {
       printf("arg %d '%c' ", i, types[i]);
@@ -218,7 +220,7 @@ int pong_handler(const char *path, const char *types, lo_arg **argv,
     lo_timetag sent = argv[1]->t;
     lo_timetag received = argv[2]->t;
     double now = now_f();
-    printf("sent: %f received: %f now: %f\n", 
+    printf("sent: %f received: %f now: %f\n",
            t2f(sent), t2f(received), now);
     double latency = (now - t2f(sent)) / 2.0;
     // TODO - average over several goes
@@ -238,7 +240,67 @@ int pong_handler(const char *path, const char *types, lo_arg **argv,
       printf("average: %f\n", time_offset);
     }
   }
-  
+
+  return(0);
+}
+
+
+void add_change(double time_when, float beat_when, float bpm) {
+  t_change *change = (t_change *) calloc(sizeof(t_change), 1);
+  int last = 0;
+
+  change->time_when = time_when;
+  change->beat_when = beat_when;
+  change->bpm = bpm;
+
+  pthread_mutex_lock(&change_lock);
+
+  if (next_change == NULL) {
+    next_change = change;
+  }
+  else {
+    t_change *p = next_change;
+    while (p->time_when < change->time_when) {
+      if (p->next == NULL) {
+        last = 1;
+        break;
+      }
+      p = p->next;
+    }
+
+    if (last) {
+      change->prev = p;
+      p->next = change;
+    }
+    else {
+      change->next = p;
+      change->prev = p->prev;
+      p->prev = change;
+      if (change->prev != NULL) {
+        change->prev->next = change;
+      }
+    }
+  }
+  pthread_mutex_unlock(&change_lock);
+}
+
+int set_change_handler(const char *path, const char *types, lo_arg **argv,
+                 int argc, lo_message data, void *user_data) {
+  //int sender = argv[0]->i;
+  lo_timetag when_t = argv[1]->t;
+  float when_beat = argv[2]->f;
+  float bpm = argv[3]->f;
+
+  add_change(t2f(when_t), when_beat, bpm);
+
+  return(0);
+}
+
+int get_change_handler(const char *path, const char *types, lo_arg **argv,
+                 int argc, lo_message data, void *user_data) {
+  //int sender = argv[0]->i;
+
+
   return(0);
 }
 
@@ -266,7 +328,7 @@ void cycle() {
     master_id = id;
     master_address = NULL;
   }
-  
+
   if (master_id<0 && !voting) {
     send_claim_master();
   }
@@ -283,6 +345,9 @@ int main (int argc, char **argv) {
 
   initrand();
   setid();
+
+  pthread_mutex_init(&change_lock, NULL);
+
   ms = lo_server_thread_new_multicast("224.0.1.1", "6010", error);
   //st = lo_server_thread_new(NULL, error);
   //lo_server_thread_start(st);
@@ -291,6 +356,9 @@ int main (int argc, char **argv) {
   lo_server_thread_add_method(ms, "/app/thrum/assert", "i", assert_handler, NULL);
   lo_server_thread_add_method(ms, "/app/thrum/ping", "it", ping_handler, NULL);
   lo_server_thread_add_method(ms, "/app/thrum/pong", "itt", pong_handler, NULL);
+  lo_server_thread_add_method(ms, "/app/thrum/change/set", "itff", set_change_handler, NULL);
+  lo_server_thread_add_method(ms, "/app/thrum/change/get", "i", get_change_handler, NULL);
+
   multicast_address = lo_address_new("224.0.1.1", "6010");
   lo_address_set_ttl(multicast_address, 1); /* set multicast scope to LAN */
   sleep(1);
